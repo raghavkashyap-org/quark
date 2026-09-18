@@ -320,6 +320,85 @@ check('the replacement request drops what gpt-oss rejects and adds what Groq nee
 check('a non-tool-capable id is never picked as the replacement',
   !w.some((x) => /compound|guard|whisper/.test(String(x.model))), w.map((x) => x.model).join(','));
 
+// ══ PHASE 7 — ?probe=1 tells the truth about the wire ════════════════════
+// Config diagnostics can be perfect while the provider still refuses the
+// request. The probe spends a few tiny calls to say what actually happened.
+console.log('\n═══ PHASE 7 · the live probe ═══');
+const retireMock = spawn('node', ['tests/mock-openai-server.mjs'], {
+  stdio: ['ignore', 'pipe', 'pipe'],
+  env: { ...process.env, MOCK_OPENAI_PORT: '9996', MOCK_RETIRE_LLAMA: '1' },
+});
+await new Promise((r2) => setTimeout(r2, 900));
+app.kill('SIGKILL');
+app = await startApp({
+  LLM_PROVIDER: 'openai',
+  OPENAI_API_KEY: 'mock-openai-key',
+  OPENAI_BASE_URL: 'http://127.0.0.1:9996/v1',
+  OPENAI_MODEL: 'llama-3.3-70b-versatile',
+  GEMINI_API_KEY: '',
+  LLM_FALLBACK_PROVIDER: '',
+  QUARK_ALLOWED_ORIGINS: '',
+});
+const probe = await (await fetch(`${APP}/api/chat?probe=1`)).json();
+const oai = probe.providers?.openai || {};
+check('the probe tests the configured model on its own (no silent swap)',
+  oai.attempt?.ok === false && /bad_model|switched off|model_not_found|does not exist/i.test(JSON.stringify(oai.attempt?.error || '')),
+  `ok=${oai.attempt?.ok} error=${JSON.stringify(oai.attempt?.error || null).slice(0, 90)}`);
+check('the probe lists what the host actually serves',
+  oai.hostModels?.count >= 3 && Array.isArray(oai.hostModels?.ids), `count=${oai.hostModels?.count}`);
+check('the probe finds a model this key CAN use',
+  oai.workingModel === 'openai/gpt-oss-120b' && Array.isArray(oai.candidates) && oai.candidates.length >= 1,
+  `working=${oai.workingModel} candidates=${(oai.candidates || []).join(',')}`);
+check('the verdict tells the operator the exact env change',
+  /OPENAI_MODEL=openai\/gpt-oss-120b/.test((probe.verdict || []).join(' ')),
+  (probe.verdict || []).join(' | ').slice(0, 140));
+check('the probe reports the fallback provider too', /GEMINI: not configured/.test((probe.verdict || []).join(' ')));
+check('the probe never leaks the key', !JSON.stringify(probe).includes('mock-openai-key'));
+
+// It spends real quota on an unauthenticated URL, so it must be capped.
+const probe2 = await fetch(`${APP}/api/chat?probe=1`);
+const probe3 = await fetch(`${APP}/api/chat?probe=1`);
+const probe4 = await fetch(`${APP}/api/chat?probe=1`);
+const p4 = await probe4.json().catch(() => null);
+check('the probe is rate-limited (2nd and 3rd run, then a 429)',
+  probe2.status === 200 && probe3.status === 200 && probe4.status === 429 && p4?.error?.code === 'rate_limited',
+  `${probe2.status}/${probe3.status}/${probe4.status} ${p4?.error?.message?.slice(0, 60) || ''}`);
+
+retireMock.kill('SIGKILL');
+
+// ══ PHASE 8 — a rescued turn still reports the broken primary ══════════════
+// The failure that hides best: Groq is dead, Gemini answers, everything looks
+// fine, and the operator never learns the provider they configured is down.
+console.log('\n═══ PHASE 8 · degraded turn is not silent ═══');
+app.kill('SIGKILL');
+app = await startApp({
+  LLM_PROVIDER: 'openai',
+  OPENAI_API_KEY: 'mock-openai-key',
+  OPENAI_BASE_URL: 'http://127.0.0.1:9997/v1',   // nothing listening
+  OPENAI_MODEL: 'openai/gpt-oss-120b',
+  GEMINI_API_KEY: 'mock-gemini-key',
+  GEMINI_API_BASE: 'http://127.0.0.1:9999/v1beta',
+  LLM_FALLBACK_PROVIDER: 'gemini',
+  QUARK_ALLOWED_ORIGINS: '',
+});
+r = await postChat({ contents: [{ role: 'user', parts: [{ text: 'hello there' }] }] });
+check('the turn still succeeds on the fallback',
+  r.status === 200 && r.json?.ok === true && /gemini/.test(String(r.json?.model)),
+  `status=${r.status} model=${r.json?.model}`);
+check('and it says the primary failed, with the reason',
+  Boolean(r.json?.degraded) && r.json?.degraded?.failedProvider === 'openai'
+    && /reach|network|9997/i.test(String(r.json?.degraded?.reason)),
+  JSON.stringify(r.json?.degraded || null).slice(0, 140));
+check('the degraded report points at the probe',
+  /probe=1/.test(String(r.json?.degraded?.hint || '')), String(r.json?.degraded?.hint || ''));
+
+// streaming path carries the same signal
+r = await postChat({ contents: [{ role: 'user', parts: [{ text: 'hello again' }] }], stream: true });
+const doneFrame = String(r.text || '').split('\n').filter((l) => l.startsWith('data: ')).map((l) => { try { return JSON.parse(l.slice(6)); } catch { return null; } }).find((d) => d?.type === 'done' || d?.ok === true);
+check('the streaming done frame carries it too',
+  Boolean(doneFrame?.degraded) || /degraded/.test(String(r.text || '')),
+  JSON.stringify(doneFrame?.degraded || r.text?.slice(0, 80) || null).slice(0, 120));
+
 shutdown();
 const passed = results.filter((r2) => r2.p).length;
 console.log(`\n${'═'.repeat(34)}\n  ${passed}/${results.length} provider checks passed\n${'═'.repeat(34)}`);

@@ -90,7 +90,10 @@ const server = http.createServer((req, res) => {
       res.writeHead(400, { 'content-type': 'application/json' });
       return res.end(JSON.stringify({ error: { message, type: 'invalid_request_error', ...(code ? { code } : {}) } }));
     };
-    if (/retiredmodel/.test(String(lastUserText)) && /llama-3\.3-70b|llama-3\.1-8b/.test(String(payload.model || ''))) {
+    // MOCK_RETIRE_LLAMA=1 simulates Groq after 2026-08-16 for every request,
+    // not just ones whose text asks for it — used to test the ?probe=1 report.
+    const retireAll = process.env.MOCK_RETIRE_LLAMA === '1';
+    if ((retireAll || /retiredmodel/.test(String(lastUserText))) && /llama-3\.3-70b|llama-3\.1-8b/.test(String(payload.model || ''))) {
       res.writeHead(400, { 'content-type': 'application/json' });
       return res.end(JSON.stringify({ error: {
         message: `The model \`${payload.model}\` does not exist or you do not have access to it.`,

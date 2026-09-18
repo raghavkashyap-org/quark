@@ -399,7 +399,7 @@ multi-provider failover, and a mock Gemini that also simulates thinking-model
 output (`{"thought":true}` parts, `MAX_TOKENS`) and a blocked speech service —
 so the fallbacks are tested rather than assumed.
 
-**Current: 34 + 78 + 55 + 35 unit · 64/64 browser · 21/21 on-device STT · 34/34
+**Current: 34 + 78 + 55 + 40 unit · 64/64 browser · 21/21 on-device STT · 45/45
 providers · 26/27 live-model.** The one live skip is correct-by-design: the permission
 dialog is not shown when geolocation is already `granted`.
 

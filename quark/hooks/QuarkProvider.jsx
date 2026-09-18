@@ -79,6 +79,9 @@ export function QuarkProvider({ children }) {
 
   // ── refs ──────────────────────────────────────────────────────────────
   const contentsRef = useRef([]);
+  // A broken primary that a fallback keeps rescuing is invisible unless we say
+  // something — but saying it on every turn would be noise, so: once per reason.
+  const degradedSeen = useRef(null);
   const abortRef = useRef(null);
   const busyRef = useRef(false);
   const transcriptRef = useRef(transcript);
@@ -489,7 +492,31 @@ export function QuarkProvider({ children }) {
             break;
           }
 
-          setConn({ state: 'live', detail: res.model || conn.model, model: res.model, tools: conn.tools });
+          // The turn succeeded, but on the FALLBACK: the configured provider is
+          // broken and would stay that way silently. Surface it once.
+          if (res.degraded && degradedSeen.current !== res.degraded.reason) {
+            degradedSeen.current = res.degraded.reason;
+            pushToast({
+              kind: 'warn',
+              title: `${res.degraded.failedProvider || 'primary'} failed — ${res.model || 'fallback'} answered`,
+              message: `${res.degraded.reason} · open /api/chat?probe=1 for the full report`,
+              ttl: 16000,
+            });
+            addEntry({
+              role: 'trace',
+              name: 'provider-fallback',
+              status: 'done',
+              detail: `${res.degraded.failedModel || 'primary'}: ${String(res.degraded.reason).slice(0, 90)}`,
+            });
+          }
+          setConn({
+            state: 'live',
+            detail: res.degraded
+              ? `${res.model || conn.model} · fallback (${res.degraded.failedProvider || 'primary'} down)`
+              : (res.model || conn.model),
+            model: res.model,
+            tools: conn.tools,
+          });
 
           // ── tool calls ───────────────────────────────────────────────
           if (res.functionCalls?.length) {

@@ -248,21 +248,30 @@ export function isModelNotFound(status, json) {
 }
 
 /**
- * Choose a replacement from the ids a host actually serves (`GET /models`).
- * Prefers the known-good list, then falls back to any tool-capable-looking id
- * the host reports, so a future retirement still self-heals.
+ * Every plausible replacement, best first, from the ids a host actually serves
+ * (`GET /models`). Several can be needed because "model_not_found" also means
+ * *your key has no access* — a free account can be blocked from one id and
+ * allowed the next, so trying a single replacement is not enough.
  */
-export function pickReplacementModel(available, requested) {
+export function replacementCandidates(available, requested, exclude = []) {
   const ids = (Array.isArray(available) ? available : [])
     .map((m) => (typeof m === 'string' ? m : m?.id))
     .filter(Boolean);
-  if (!ids.length) return RETIRED_MODELS[requested]?.use || null;
-  for (const want of MODEL_PREFERENCE) {
-    if (ids.includes(want) && want !== requested) return want;
+  const blocked = new Set([requested, ...exclude]);
+  if (!ids.length) {
+    const fallback = RETIRED_MODELS[requested]?.use;
+    return fallback && !blocked.has(fallback) ? [fallback] : [];
   }
-  const generic = ids.find((id) => id !== requested && /gpt-oss|qwen|llama|kimi|minimax/i.test(id)
-    && !/guard|safeguard|compound|whisper|embed|tts|playai|allam|orpheus|distill/i.test(id));
-  return generic || null;
+  const toolCapable = (id) => /gpt-oss|qwen|llama|kimi|minimax/i.test(id)
+    && !/guard|safeguard|compound|whisper|embed|tts|playai|allam|orpheus|distill/i.test(id);
+  const preferred = MODEL_PREFERENCE.filter((id) => ids.includes(id) && !blocked.has(id));
+  const others = ids.filter((id) => !blocked.has(id) && toolCapable(id) && !preferred.includes(id));
+  return [...preferred, ...others];
+}
+
+/** Best single replacement, or null when the host offers nothing usable. */
+export function pickReplacementModel(available, requested, exclude = []) {
+  return replacementCandidates(available, requested, exclude)[0] || null;
 }
 
 export function classifyOpenAI(status, json, model) {

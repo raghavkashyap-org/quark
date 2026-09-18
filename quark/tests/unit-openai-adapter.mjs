@@ -11,7 +11,7 @@
 import {
   toOpenAIRequest, toOpenAITools, toOpenAIMessages,
   isModelNotFound, pickReplacementModel, RETIRED_MODELS, MODEL_PREFERENCE, classifyOpenAI,
-  capOutputTokens, TPM_SAFE_OUTPUT_TOKENS,
+  capOutputTokens, TPM_SAFE_OUTPUT_TOKENS, replacementCandidates,
 } from '../lib/llm-openai.js';
 
 const results = [];
@@ -115,6 +115,19 @@ check('a missing or invalid value falls back to the safe default',
 check('the clamp reaches the request body',
   toOpenAIRequest({ ...base, model: 'openai/gpt-oss-120b', base: 'https://api.groq.com/openai/v1',
     maxTokens: capOutputTokens({ base: 'https://api.groq.com/openai/v1', requested: 8192 }).value }).max_completion_tokens === TPM_SAFE_OUTPUT_TOKENS);
+
+// ── walking several candidates (model_not_found also means "no access") ─────
+const cat2 = ['openai/gpt-oss-120b', 'qwen/qwen3.6-27b', 'openai/gpt-oss-20b', 'groq/compound'];
+check('candidates come back best-first', replacementCandidates(cat2, 'llama-3.3-70b-versatile').join(',') === 'openai/gpt-oss-120b,qwen/qwen3.6-27b,openai/gpt-oss-20b',
+  replacementCandidates(cat2, 'llama-3.3-70b-versatile').join(','));
+check('already-tried models are excluded',
+  pickReplacementModel(cat2, 'llama-3.3-70b-versatile', ['openai/gpt-oss-120b']) === 'qwen/qwen3.6-27b');
+check('exclusion walks all the way down the list',
+  pickReplacementModel(cat2, 'llama-3.3-70b-versatile', ['openai/gpt-oss-120b', 'qwen/qwen3.6-27b']) === 'openai/gpt-oss-20b');
+check('when everything is exhausted there is no guess',
+  pickReplacementModel(cat2, 'llama-3.3-70b-versatile', ['openai/gpt-oss-120b', 'qwen/qwen3.6-27b', 'openai/gpt-oss-20b']) === null);
+check('non-tool-capable ids are never candidates',
+  !replacementCandidates(cat2, 'x').includes('groq/compound'));
 
 // ── summary ─────────────────────────────────────────────────────────────────
 const passed = results.filter((r) => r.p).length;

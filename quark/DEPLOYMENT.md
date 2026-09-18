@@ -340,6 +340,31 @@ healthy: the badge flips to **LOCAL CORE** and the local engine answers, so it
 *seems* like the provider was never configured. It usually means the provider
 **rejected the request at runtime**. Three steps:
 
+**0. Run the probe.** `GET https://<your-app>/api/chat?probe=1` spends a few tiny
+requests and reports what each provider *actually said* — configuration
+diagnostics can be perfect while the provider still refuses the request:
+
+```json
+{ "probe": true,
+  "providers": {
+    "openai": {
+      "base": "https://api.groq.com/openai/v1",
+      "configuredModel": "llama-3.3-70b-versatile",
+      "attempt": { "ok": true, "servedBy": "openai/gpt-oss-120b",
+                   "recoveredWith": "switched to openai/gpt-oss-120b", "ms": 640 },
+      "hostModels": { "count": 14, "ids": ["openai/gpt-oss-120b", "qwen/qwen3.6-27b", "…"] },
+      "replacement": "openai/gpt-oss-120b" },
+    "gemini": { "model": "gemini-2.5-flash", "ok": true, "ms": 410 } },
+  "verdict": ["OPENAI-COMPATIBLE: works. Served by "openai/gpt-oss-120b" in 640ms (switched to openai/gpt-oss-120b).",
+              "Set OPENAI_MODEL=openai/gpt-oss-120b to skip the automatic re-route and its extra round trip.",
+              "GEMINI: works. gemini-2.5-flash replied in 410ms."] }
+```
+
+`attempt.servedBy` is the model that really answered; `hostModels.ids` is the
+catalogue your key can use; `verdict` says what to change. The probe never
+returns the key, and because each run spends real quota on an unauthenticated
+URL it is capped at **3 runs/minute per IP** (429 after that).
+
 **1. Read the diagnostics endpoint.** `GET https://<your-app>/api/chat` reports
 what the server actually sees — no guesswork about Vercel's env UI:
 
@@ -367,6 +392,21 @@ fails and the fallback fails too, the response carries **both** reasons:
 `primaryError` is the one that matters — it is the provider you actually
 configured. The same text is pushed to the HUD as a toast, so you can see it
 during a demo without opening devtools.
+
+**A rescued turn is not silent either.** When the primary fails and the fallback
+*answers*, the response carries `degraded` and the HUD shows one warning toast
+(once per distinct reason, so it never nags):
+
+```json
+{ "ok": true, "model": "gemini-2.5-flash", "text": "…",
+  "degraded": { "failedProvider": "openai", "failedModel": "llama-3.3-70b-versatile",
+                "reason": "Model \"llama-3.3-70b-versatile\" was switched off by the provider on 2026-08-16…",
+                "code": "bad_model", "hint": "GET /api/chat?probe=1 reports exactly what each provider said." } }
+```
+
+This is the case that hides best: everything appears to work, answers arrive,
+and the provider you configured and paid attention to is quietly dead. The
+connection badge reads `gemini-2.5-flash · fallback (openai down)`.
 
 **3. Match the code to the fix.**
 

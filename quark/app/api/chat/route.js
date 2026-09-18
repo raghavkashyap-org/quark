@@ -32,6 +32,7 @@ import {
   capOutputTokens,
   isModelNotFound,
   pickReplacementModel,
+  replacementCandidates,
   RETIRED_MODELS,
 } from '@/lib/llm-openai';
 
@@ -42,6 +43,12 @@ export const maxDuration = 60;
 
 const MAX_BODY_BYTES = 512 * 1024; // 512 KB of conversation is far more than enough
 const MAX_MESSAGES = 60;
+
+// `?probe=1` spends REAL provider quota (up to 5 tiny calls per run), on an
+// unauthenticated URL. Without a cap, one crawler or one impatient refresh loop
+// could eat a free tier's whole minute. Best-effort per warm instance, like the
+// rest of the limiter here.
+const PROBE_PER_MINUTE = 3;
 
 // ── best-effort in-memory rate limit ──────────────────────────────────────
 // NOTE: Vercel serverless functions are stateless and may run on many
@@ -166,7 +173,7 @@ async function listHostModels(cfg) {
  * SSE stream that speaks the SAME frame protocol as the Gemini path
  * (delta / functioncall / done / error), so the browser client is unchanged.
  */
-async function runOpenAI({ cfg, contents, wantStream, declarations = TOOL_DECLARATIONS, systemPrompt = SYSTEM_PROMPT, altTried = false, modelFallbackFrom = null, retry = null }) {
+async function runOpenAI({ cfg, contents, wantStream, declarations = TOOL_DECLARATIONS, systemPrompt = SYSTEM_PROMPT, modelFallbackFrom = null, retry = null, allowModelSwap = true }) {
   // `retry` carries a repaired request body from one of the self-healing
   // passes below (see "400 self-healing"). Everything else builds the body
   // from scratch.
@@ -225,7 +232,7 @@ async function runOpenAI({ cfg, contents, wantStream, declarations = TOOL_DECLAR
     const msg = String(json?.error?.message || '');
     const code = String(json?.error?.code || '');
     const again = (patch, note) => runOpenAI({
-      cfg, contents, wantStream, declarations, systemPrompt, altTried, modelFallbackFrom,
+      cfg, contents, wantStream, declarations, systemPrompt, modelFallbackFrom, allowModelSwap,
       retry: { ...(retry || {}), ...patch, note },
     });
 
@@ -247,14 +254,19 @@ async function runOpenAI({ cfg, contents, wantStream, declarations = TOOL_DECLAR
   // only symptom is a `model_not_found` that reads like a typo. Ask the host
   // what it really serves and retry once on the best tool-capable match, so a
   // shutdown degrades to "still answers" instead of "LOCAL CORE".
-  if (isModelNotFound(res.status, json) && !altTried) {
+  // `model_not_found` also covers "your key has no access to this model", so a
+  // single replacement is not enough — walk the candidate list (bounded at 3
+  // swaps so a broken catalogue cannot turn one turn into ten requests).
+  const triedModels = retry?.triedModels || [];
+  if (isModelNotFound(res.status, json) && allowModelSwap && triedModels.length < 3) {
     const offered = await listHostModels(cfg);
-    const alt = pickReplacementModel(offered || [], cfg.openai.model);
+    const alt = pickReplacementModel(offered || [], cfg.openai.model, triedModels);
     if (alt) {
       return runOpenAI({
         cfg: { ...cfg, openai: { ...cfg.openai, model: alt } },
-        contents, wantStream, declarations, systemPrompt, retry,
-        altTried: true, modelFallbackFrom: cfg.openai.model,
+        contents, wantStream, declarations, systemPrompt, allowModelSwap,
+        retry: { ...(retry || {}), triedModels: [...triedModels, cfg.openai.model] },
+        modelFallbackFrom: modelFallbackFrom || cfg.openai.model,
       });
     }
   }
@@ -453,8 +465,169 @@ function diagnostics(cfg) {
   };
 }
 
-export async function GET() {
+/**
+ * What the client shows when the primary provider failed but the fallback
+ * answered: enough to diagnose, short enough for a toast.
+ */
+function degradedBy(primaryError, cfg) {
+  // `message` is the human sentence ("Could not reach https://api.groq.com…");
+  // `hint` is sometimes just the raw cause ("fetch failed"), so prefer message.
+  const reason = primaryError?.message || primaryError?.hint || `HTTP ${primaryError?.status || 'unknown'}`;
+  return {
+    failedProvider: cfg.provider === 'openai' ? 'openai' : 'gemini',
+    failedModel: cfg.openai.model,
+    reason: String(reason).slice(0, 200),
+    code: primaryError?.code || null,
+    hint: 'GET /api/chat?probe=1 reports exactly what each provider said.',
+  };
+}
+
+/**
+ * Live provider probe — `GET /api/chat?probe=1`.
+ *
+ * Diagnostics prove the *configuration* is right; this proves what happens on
+ * the *wire*. It spends a few tiny requests to report what each provider
+ * actually said, which models the host serves, and whether the automatic
+ * replacement works — the difference between "Groq is configured" and "Groq
+ * answers". Safe to run in a browser; it never exposes the key.
+ */
+async function probeProviders(cfg) {
+  const out = { probe: true, at: new Date().toISOString(), providers: {}, verdict: [] };
+  const ping = [{ role: 'user', parts: [{ text: 'ping' }] }];
+
+  // ── OpenAI-compatible host (Groq / OpenRouter / Ollama / llama.cpp) ──────
+  if (cfg.openai.key) {
+    const tiny = { ...cfg, openai: { ...cfg.openai, maxTokens: 16 } };
+    const attempt = async (model) => {
+      const started = Date.now();
+      try {
+        const res = await runOpenAI({
+          cfg: { ...tiny, openai: { ...tiny.openai, model } },
+          contents: ping,
+          wantStream: false,
+          declarations: [],
+          systemPrompt: 'Reply with the single word: pong',
+          // Probe each model on its own — an automatic swap here would hide
+          // exactly the thing being diagnosed.
+          allowModelSwap: false,
+        });
+        const body = await res.clone().json().catch(() => null);
+        return {
+          requestedModel: model,
+          status: res.status,
+          ok: res.status < 400,
+          ms: Date.now() - started,
+          servedBy: body?.model || null,
+          text: (body?.text || '').slice(0, 40) || null,
+          recoveredWith: body?.recoveredWith || null,
+          error: body?.error || null,
+        };
+      } catch (e) {
+        return { requestedModel: model, ok: false, ms: Date.now() - started, error: { code: 'probe_exception', message: String(e?.message || e) } };
+      }
+    };
+
+    const first = await attempt(cfg.openai.model);
+    const ids = await listHostModels(cfg);
+    const candidates = replacementCandidates(ids || [], cfg.openai.model).slice(0, 3);
+    const o = {
+      base: cfg.openai.base,
+      configuredModel: cfg.openai.model,
+      outputTokenBudget: cfg.openai.maxTokens,
+      attempt: first,
+      hostModels: ids ? { count: ids.length, ids: ids.slice(0, 40) } : { error: 'GET /models failed, was empty, or the key cannot list models' },
+      candidates,
+    };
+    // If the configured model is dead, find one that this key CAN use — that is
+    // the exact question "what do I set OPENAI_MODEL to?" needs answering.
+    if (!first.ok && candidates.length) {
+      o.replacementAttempts = [];
+      for (const c of candidates) {
+        const res = await attempt(c);
+        o.replacementAttempts.push(res);
+        if (res.ok) { o.workingModel = c; break; }
+      }
+    }
+    out.providers.openai = o;
+
+    if (first.ok) {
+      out.verdict.push(`OPENAI-COMPATIBLE: works. "${first.servedBy || cfg.openai.model}" replied in ${first.ms}ms${first.recoveredWith ? ` (${first.recoveredWith})` : ''}.`);
+    } else if (o.workingModel) {
+      out.verdict.push(`OPENAI-COMPATIBLE: "${cfg.openai.model}" is unusable with this key, but "${o.workingModel}" works. Set OPENAI_MODEL=${o.workingModel} and redeploy.`);
+      out.verdict.push(`Reason the configured model failed: ${first.error?.code || first.status} — ${(first.error?.message || first.error?.hint || '').slice(0, 140)}`);
+    } else {
+      out.verdict.push(`OPENAI-COMPATIBLE: FAILED — ${first.error?.code || first.status}: ${(first.error?.message || first.error?.hint || 'unknown').slice(0, 160)}`);
+      (o.replacementAttempts || []).forEach((r2) => out.verdict.push(
+        `  also tried "${r2.requestedModel}": ${r2.error?.code || r2.status} — ${(r2.error?.message || r2.error?.hint || '').slice(0, 120)}`,
+      ));
+      if (!candidates.length) out.verdict.push('  the host offered no tool-capable replacement (is the key allowed to list models?).');
+    }
+  } else {
+    out.providers.openai = { skipped: 'OPENAI_API_KEY is empty' };
+    out.verdict.push('OPENAI-COMPATIBLE: not configured (OPENAI_API_KEY is empty).');
+  }
+
+  // ── Gemini ───────────────────────────────────────────────────────────────
+  if (cfg.key) {
+    const started = Date.now();
+    try {
+      const res = await fetch(`${cfg.base}/models/${cfg.model}:generateContent`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-goog-api-key': cfg.key },
+        body: JSON.stringify({
+          contents: ping,
+          generationConfig: { maxOutputTokens: 16, thinkingConfig: { thinkingBudget: 0 } },
+        }),
+        signal: AbortSignal.timeout(20000),
+      });
+      const body = await res.json().catch(() => null);
+      const text = (body?.candidates?.[0]?.content?.parts || []).map((q) => q.text || '').join('').slice(0, 40);
+      out.providers.gemini = {
+        model: cfg.model, status: res.status, ok: res.ok, ms: Date.now() - started,
+        text: text || null, error: body?.error || null,
+      };
+      out.verdict.push(res.ok
+        ? `GEMINI: works. ${cfg.model} replied in ${out.providers.gemini.ms}ms.`
+        : `GEMINI: FAILED — HTTP ${res.status}: ${String(body?.error?.message || '').slice(0, 160)}`);
+    } catch (e) {
+      out.providers.gemini = { model: cfg.model, ok: false, error: { code: 'network', message: String(e?.message || e) } };
+      out.verdict.push(`GEMINI: FAILED — unreachable (${String(e?.message || e).slice(0, 120)}).`);
+    }
+  } else {
+    out.providers.gemini = { skipped: 'GEMINI_API_KEY is empty' };
+    out.verdict.push('GEMINI: not configured (GEMINI_API_KEY is empty).');
+  }
+
+  out.effectiveProvider = cfg.openai.key && (cfg.provider === 'openai' || !cfg.key) ? 'openai' : 'gemini';
+  out.fallbackProvider = cfg.fallbackProvider || null;
+  return out;
+}
+
+export async function GET(request) {
   const cfg = env();
+
+  // ── ?probe=1 → actually call the provider and report every step ─────────
+  // Diagnostics can prove the *config* is right and still leave you guessing
+  // about the wire. This spends one tiny request to answer: what did the host
+  // say, what models does it serve, and which one would we switch to?
+  if (request?.nextUrl?.searchParams?.get('probe') === '1') {
+    const limit = rateLimit(`probe:${clientIp(request)}`, PROBE_PER_MINUTE);
+    if (!limit.ok) {
+      return NextResponse.json(
+        {
+          probe: true,
+          ok: false,
+          error: {
+            code: 'rate_limited',
+            message: `The probe spends real provider quota, so it is limited to ${PROBE_PER_MINUTE} runs per minute. Wait a moment and run it again.`,
+          },
+        },
+        { status: 429 },
+      );
+    }
+    return NextResponse.json(await probeProviders(cfg));
+  }
+
   return NextResponse.json({
     service: 'quark-gemini-proxy',
     version: PROXY_VERSION,
@@ -707,6 +880,9 @@ export async function POST(req) {
       functionCalls,
       finishReason: cand?.finishReason || null,
       blocked,
+      // The fallback rescued this turn — say so, and say why the primary died.
+      // A working answer from the wrong provider is how a dead key stays hidden.
+      ...(primaryError ? { degraded: degradedBy(primaryError, cfg) } : {}),
       usage: json?.usageMetadata
         ? {
             promptTokens: json.usageMetadata.promptTokenCount ?? 0,
@@ -827,6 +1003,7 @@ export async function POST(req) {
             finishReason,
             blocked: finishReason === 'SAFETY' || finishReason === 'PROHIBITED_CONTENT',
             usage,
+            ...(primaryError ? { degraded: degradedBy(primaryError, cfg) } : {}),
           }),
         );
       } catch (e) {
