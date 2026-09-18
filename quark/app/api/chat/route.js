@@ -29,6 +29,10 @@ import {
   mapOpenAIResponse,
   chunkText,
   classifyOpenAI,
+  capOutputTokens,
+  isModelNotFound,
+  pickReplacementModel,
+  RETIRED_MODELS,
 } from '@/lib/llm-openai';
 
 export const runtime = 'nodejs';
@@ -111,8 +115,16 @@ function env() {
     openai: {
       key: (process.env.OPENAI_API_KEY || '').trim(),
       base: (process.env.OPENAI_BASE_URL || 'https://api.groq.com/openai/v1').replace(/\/$/, ''),
-      model: (process.env.OPENAI_MODEL || 'llama-3.3-70b-versatile').trim(),
-      maxTokens: parseInt(process.env.OPENAI_MAX_TOKENS || '2048', 10),
+      model: (process.env.OPENAI_MODEL || 'openai/gpt-oss-120b').trim(),
+      ...(() => {
+        const b = (process.env.OPENAI_BASE_URL || 'https://api.groq.com/openai/v1').replace(/\/$/, '');
+        const cap = capOutputTokens({
+          base: b,
+          requested: parseInt(process.env.OPENAI_MAX_TOKENS || '2048', 10),
+          ignoreCap: process.env.QUARK_IGNORE_TPM_CAP === '1',
+        });
+        return { maxTokens: cap.value, maxTokensCapped: cap.capped };
+      })(),
     },
   };
 }
@@ -126,11 +138,54 @@ function availableProviders(cfg) {
 }
 
 /**
+ * What model ids does this host actually serve? Cached for 10 minutes so that
+ * surviving a retirement costs one extra request, not one per turn.
+ */
+const hostModelsCache = new Map();
+async function listHostModels(cfg) {
+  const hit = hostModelsCache.get(cfg.openai.base);
+  if (hit && Date.now() - hit.at < 10 * 60 * 1000) return hit.ids;
+  try {
+    const res = await fetch(`${cfg.openai.base}/models`, {
+      headers: { authorization: `Bearer ${cfg.openai.key}` },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return null;
+    const json = await res.json().catch(() => null);
+    const ids = (json?.data || []).map((m) => m?.id).filter(Boolean);
+    if (!ids.length) return null;
+    hostModelsCache.set(cfg.openai.base, { at: Date.now(), ids });
+    return ids;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Run one turn against an OpenAI-compatible host and return either JSON or an
  * SSE stream that speaks the SAME frame protocol as the Gemini path
  * (delta / functioncall / done / error), so the browser client is unchanged.
  */
-async function runOpenAI({ cfg, contents, wantStream, declarations = TOOL_DECLARATIONS, systemPrompt = SYSTEM_PROMPT }) {
+async function runOpenAI({ cfg, contents, wantStream, declarations = TOOL_DECLARATIONS, systemPrompt = SYSTEM_PROMPT, altTried = false, modelFallbackFrom = null, retry = null }) {
+  // `retry` carries a repaired request body from one of the self-healing
+  // passes below (see "400 self-healing"). Everything else builds the body
+  // from scratch.
+  const body = retry?.body || toOpenAIRequest({
+    contents,
+    systemPrompt,
+    declarations,
+    model: cfg.openai.model,
+    maxTokens: cfg.openai.maxTokens,
+    base: cfg.openai.base,
+  });
+  // Retries may swap the model (retirement) — the body must follow cfg.
+  body.model = cfg.openai.model;
+  if (retry?.dropTools) {
+    delete body.tools;
+    delete body.tool_choice;
+    delete body.parallel_tool_calls;
+  }
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), cfg.timeoutMs);
   let res;
@@ -139,15 +194,7 @@ async function runOpenAI({ cfg, contents, wantStream, declarations = TOOL_DECLAR
       method: 'POST',
       signal: controller.signal,
       headers: { 'content-type': 'application/json', authorization: `Bearer ${cfg.openai.key}` },
-      body: JSON.stringify(
-        toOpenAIRequest({
-          contents,
-          systemPrompt,
-          declarations,
-          model: cfg.openai.model,
-          maxTokens: cfg.openai.maxTokens,
-        }),
-      ),
+      body: JSON.stringify(body),
     });
   } catch (e) {
     clearTimeout(timer);
@@ -166,8 +213,57 @@ async function runOpenAI({ cfg, contents, wantStream, declarations = TOOL_DECLAR
   const json = await res.json().catch(() => null);
   clearTimeout(timer);
 
+  // ── 400 self-healing ─────────────────────────────────────────────────
+  // A 400 from an OpenAI-shaped host is almost always fixable by the caller,
+  // and every one of these used to end the turn in LOCAL CORE:
+  //   • "unsupported parameter: 'x'" → the host rejects a field we sent.
+  //   • Groq's `tool_use_failed` → the model emitted a malformed function
+  //     call. Groq's own guidance is to lower the temperature and retry; if
+  //     that still fails, retry once with no tools so the user still gets an
+  //     answer from the provider they configured.
+  if (res.status === 400) {
+    const msg = String(json?.error?.message || '');
+    const code = String(json?.error?.code || '');
+    const again = (patch, note) => runOpenAI({
+      cfg, contents, wantStream, declarations, systemPrompt, altTried, modelFallbackFrom,
+      retry: { ...(retry || {}), ...patch, note },
+    });
+
+    const unsupported = msg.match(/unsupported parameter:?\s*'?([a-z_0-9]+)'?/i)?.[1];
+    if (unsupported && body[unsupported] !== undefined && !(retry?.stripped || []).includes(unsupported)) {
+      const cleaned = { ...body };
+      delete cleaned[unsupported];
+      return again({ body: cleaned, stripped: [...(retry?.stripped || []), unsupported] },
+        `dropped "${unsupported}"`);
+    }
+    if (/tool_use_failed|failed to call a function|invalid tool call/i.test(`${code} ${msg}`)) {
+      if (!retry?.cooled) return again({ body: { ...body, temperature: 0.2 }, cooled: true }, 'lowered temperature');
+      if (!retry?.dropTools && body.tools) return again({ dropTools: true }, 'retried without tools');
+    }
+  }
+
+  // Providers retire model ids without notice: Groq switched off
+  // llama-3.3-70b-versatile and llama-3.1-8b-instant on 2026-08-16, and the
+  // only symptom is a `model_not_found` that reads like a typo. Ask the host
+  // what it really serves and retry once on the best tool-capable match, so a
+  // shutdown degrades to "still answers" instead of "LOCAL CORE".
+  if (isModelNotFound(res.status, json) && !altTried) {
+    const offered = await listHostModels(cfg);
+    const alt = pickReplacementModel(offered || [], cfg.openai.model);
+    if (alt) {
+      return runOpenAI({
+        cfg: { ...cfg, openai: { ...cfg.openai, model: alt } },
+        contents, wantStream, declarations, systemPrompt, retry,
+        altTried: true, modelFallbackFrom: cfg.openai.model,
+      });
+    }
+  }
+
   if (!res.ok) {
     const c = classifyOpenAI(res.status, json, cfg.openai.model);
+    if (modelFallbackFrom) {
+      c.hint = `${c.hint} (Tried automatically after "${modelFallbackFrom}" was not found on this host.)`;
+    }
     return NextResponse.json(
       { ok: false, error: { ...c, message: c.hint, status: res.status, provider: 'openai' } },
       { status: res.status >= 500 ? 502 : res.status },
@@ -177,7 +273,17 @@ async function runOpenAI({ cfg, contents, wantStream, declarations = TOOL_DECLAR
   const mapped = mapOpenAIResponse(json);
 
   if (!wantStream) {
-    return NextResponse.json({ ok: true, provider: 'openai', model: cfg.openai.model, ...mapped });
+    return NextResponse.json({
+      ok: true,
+      provider: 'openai',
+      model: cfg.openai.model,
+      // Present only when a 400 had to be repaired — useful when a host starts
+      // rejecting a parameter and you want to know it happened.
+      ...(retry?.note || modelFallbackFrom
+        ? { recoveredWith: [modelFallbackFrom ? `switched to ${cfg.openai.model}` : null, retry?.note].filter(Boolean).join(', ') }
+        : {}),
+      ...mapped,
+    });
   }
 
   const encoder = new TextEncoder();
@@ -308,6 +414,22 @@ function diagnostics(cfg) {
   }
   if (gKey.present && gKey.hasWhitespace) {
     issues.push('GEMINI_API_KEY contains spaces or line breaks. Re-paste it as a single line.');
+  }
+  if (cfg.openai.maxTokensCapped) {
+    issues.push(
+      `OPENAI_MAX_TOKENS=${cfg.raw.openaiMaxTokens} was reduced to ${cfg.openai.maxTokens}: Groq's free tier allows `
+      + '8,000 tokens/minute across prompt + requested output, and a bigger ask 429s on the first request. '
+      + 'On a paid tier set QUARK_IGNORE_TPM_CAP=1 to use your own value.',
+    );
+  }
+  // A retired model id looks like a typo in the logs, so say it plainly here.
+  const retired = RETIRED_MODELS[cfg.openai.model];
+  if (oKey.present && retired) {
+    issues.push(
+      `OPENAI_MODEL=${cfg.openai.model} was switched off by the provider on ${retired.off}. `
+      + `Set OPENAI_MODEL=${retired.use} and redeploy. Requests still work for now — the proxy `
+      + `detects the shutdown and re-routes to a replacement — but every turn pays an extra round trip.`,
+    );
   }
   if (cfg.raw.openaiMaxTokens !== '' && Number.isNaN(parseInt(cfg.raw.openaiMaxTokens, 10))) {
     issues.push(`OPENAI_MAX_TOKENS is not a number ("${cfg.raw.openaiMaxTokens.slice(0, 20)}") — using 2048.`);
@@ -465,10 +587,14 @@ export async function POST(req) {
   // Explicit LLM_PROVIDER=openai, or Gemini absent while another key exists.
   const preferOpenAI =
     cfg.openai.key && (cfg.provider === 'openai' || !cfg.key);
+  let primaryError = null;
   if (preferOpenAI) {
     const r = await runOpenAI({ cfg, contents, wantStream, declarations: selection.declarations, systemPrompt });
     // A quota/outage on the secondary is recoverable by the primary.
     if (r.status < 400 || !cfg.key || cfg.fallbackProvider !== 'gemini') return r;
+    // Remember WHY the primary failed: if the fallback also dies, the user
+    // must see both reasons, not just the fallback's.
+    primaryError = (await r.clone().json().catch(() => null))?.error || { status: r.status };
   }
 
   const payload = {
@@ -549,7 +675,18 @@ export async function POST(req) {
 
     if (!res.ok) {
       const c = classify(res.status, json, cfg);
-      return NextResponse.json({ ok: false, error: { ...c, message: c.hint, status: res.status } }, { status: res.status >= 500 ? 502 : res.status });
+      return NextResponse.json(
+        {
+          ok: false,
+          error: {
+            ...c,
+            message: c.hint,
+            status: res.status,
+            ...(primaryError ? { primaryError } : {}),
+          },
+        },
+        { status: res.status >= 500 ? 502 : res.status },
+      );
     }
 
     const cand = json?.candidates?.[0];
@@ -586,7 +723,18 @@ export async function POST(req) {
     try { json = await res.json(); } catch { /* ignore */ }
     clearTimeout(timer);
     const c = classify(res.status, json, cfg);
-    return NextResponse.json({ ok: false, error: { ...c, message: c.hint, status: res.status } }, { status: res.status >= 500 ? 502 : res.status });
+    return NextResponse.json(
+      {
+        ok: false,
+        error: {
+          ...c,
+          message: c.hint,
+          status: res.status,
+          ...(primaryError ? { primaryError } : {}),
+        },
+      },
+      { status: res.status >= 500 ? 502 : res.status },
+    );
   }
 
   const encoder = new TextEncoder();

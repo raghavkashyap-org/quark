@@ -240,7 +240,8 @@ fallback and a 429 or 5xx from the primary is retried on it automatically:
 ```bash
 LLM_PROVIDER=openai                   # Groq — free, no card, 500+ tok/s
 OPENAI_API_KEY=gsk_...
-OPENAI_MODEL=llama-3.3-70b-versatile
+OPENAI_MODEL=openai/gpt-oss-120b      # llama-3.3-70b was retired 2026-08-16
+OPENAI_MAX_TOKENS=1024                # free tier is 8K tokens/min, output included
 LLM_FALLBACK_PROVIDER=gemini          # optional second line of defence
 ```
 
@@ -398,7 +399,7 @@ multi-provider failover, and a mock Gemini that also simulates thinking-model
 output (`{"thought":true}` parts, `MAX_TOKENS`) and a blocked speech service —
 so the fallbacks are tested rather than assumed.
 
-**Current: 34 + 78 + 55 unit · 64/64 browser · 21/21 on-device STT · 18/18
+**Current: 34 + 78 + 55 + 35 unit · 64/64 browser · 21/21 on-device STT · 34/34
 providers · 26/27 live-model.** The one live skip is correct-by-design: the permission
 dialog is not shown when geolocation is already `granted`.
 
@@ -415,8 +416,8 @@ dialog is not shown when geolocation is already `granted`.
 | `LLM_FALLBACK_PROVIDER` | *(empty)* | Used automatically on 429/5xx from the primary |
 | `OPENAI_API_KEY` | — | Groq / OpenRouter / Ollama / your own server |
 | `OPENAI_BASE_URL` | `https://api.groq.com/openai/v1` | Any OpenAI-compatible endpoint |
-| `OPENAI_MODEL` | `llama-3.3-70b-versatile` | e.g. `qwen3:4b` for Ollama |
-| `OPENAI_MAX_TOKENS` | `2048` | Reply budget for the OpenAI-shaped provider |
+| `OPENAI_MODEL` | `openai/gpt-oss-120b` | e.g. `qwen3:4b` for Ollama. A retired id is detected and replaced automatically |
+| `OPENAI_MAX_TOKENS` | `2048` | Reply budget; clamped to 2048 on Groq (8K tokens/min free tier) |
 | `QUARK_TOOL_BUDGET` | `14` | Max tool declarations per turn (free-tier TPM saver) |
 
 **When a provider "is attached but not working"**, `GET /api/chat` answers with a

@@ -24,6 +24,19 @@ const server = http.createServer((req, res) => {
       res.writeHead(200, { 'content-type': 'application/json' });
       return res.end(JSON.stringify({ ok: true, count: seen.length, requests: seen }));
     }
+    // GET /v1/models → the catalogue a real host serves. Deliberately missing
+    // the retired llama ids, exactly like Groq after 2026-08-16.
+    if (req.url?.startsWith('/v1/models')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ object: 'list', data: [
+        { id: 'openai/gpt-oss-120b', object: 'model' },
+        { id: 'openai/gpt-oss-20b', object: 'model' },
+        { id: 'qwen/qwen3.6-27b', object: 'model' },
+        { id: 'meta-llama/llama-guard-4-12b', object: 'model' },
+        { id: 'groq/compound', object: 'model' },
+        { id: 'whisper-large-v3-turbo', object: 'model' },
+      ] }));
+    }
     if (req.url?.startsWith('/mock/reset')) {
       seen.length = 0;
       res.writeHead(200, { 'content-type': 'application/json' });
@@ -59,7 +72,42 @@ const server = http.createServer((req, res) => {
       systemChars: (messages.find((m) => m.role === 'system')?.content || '').length,
       bytes: Buffer.byteLength(body || ''),
       stream: payload.stream === true,
+      temperature: payload.temperature ?? null,
+      // Which output-limit field went on the wire — Groq rejects the wrong one.
+      tokenParam: 'max_completion_tokens' in payload ? 'max_completion_tokens'
+        : 'max_tokens' in payload ? 'max_tokens' : null,
+      tokenValue: payload.max_completion_tokens ?? payload.max_tokens ?? null,
+      hasParallelToolCalls: 'parallel_tool_calls' in payload,
+      reasoningFormat: payload.reasoning_format ?? null,
+      recovered: null,
     });
+
+    // ── injected host-compatibility failures ────────────────────────────
+    // Real hosts 400 on parameters they do not accept and on malformed tool
+    // calls. These let the proxy's self-healing be tested without credits.
+    const lastUserText = [...messages].reverse().find((m) => m.role === 'user')?.content || '';
+    const bad = (message, code) => {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ error: { message, type: 'invalid_request_error', ...(code ? { code } : {}) } }));
+    };
+    if (/retiredmodel/.test(String(lastUserText)) && /llama-3\.3-70b|llama-3\.1-8b/.test(String(payload.model || ''))) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ error: {
+        message: `The model \`${payload.model}\` does not exist or you do not have access to it.`,
+        type: 'invalid_request_error',
+        code: 'model_not_found',
+      } }));
+    }
+    if (/badparam/.test(String(lastUserText)) && 'parallel_tool_calls' in payload) {
+      return bad("Unsupported parameter: 'parallel_tool_calls' is not supported with this model.");
+    }
+    if (/failtools/.test(String(lastUserText)) && (payload.temperature ?? 1) > 0.3 && tools0(payload).length) {
+      return bad("Failed to call a function. Please adjust your prompt. See 'failed_generation' for more details.", 'tool_use_failed');
+    }
+    if (/notools/.test(String(lastUserText)) && tools0(payload).length) {
+      return bad("Failed to call a function. Please adjust your prompt.", 'tool_use_failed');
+    }
+    seen[seen.length - 1].recovered = /failtools|notools|badparam/.test(String(lastUserText)) ? 'survived' : null;
 
     const hasToolResult = messages.some((m) => m.role === 'tool');
     const lastUser = [...messages].reverse().find((m) => m.role === 'user')?.content || '';

@@ -58,13 +58,21 @@ limits, verified against Groq's own docs (Sept 2026):
 
 | Model | Tools | Parallel tools | RPM | Tokens/min | Tokens/day | Requests/day |
 | --- | --- | --- | --- | --- | --- | --- |
-| `llama-3.3-70b-versatile` ← **default** | ✅ | ✅ | 30 | **12K** | 100K | 1,000 |
-| `openai/gpt-oss-120b` | ✅ | ❌ | 30 | 8K | 200K | 1,000 |
+| `openai/gpt-oss-120b` ← **default** | ✅ | ❌ | 30 | **8K** | 200K | 1,000 |
+| `qwen/qwen3.6-27b` | ✅ | ✅ | 30 | 8K | 200K | 1,000 |
 | `openai/gpt-oss-20b` | ✅ | ❌ | 30 | 8K | 200K | 1,000 |
-| `llama-3.1-8b-instant` | ✅ | ✅ | 30 | 6K | 500K | 14,400 |
-| `qwen/qwen3.6-27b` | ✅ | ✅ | — | 6K | 500K | 1,000 |
-| `meta-llama/llama-4-scout-17b-16e-instruct` | ❌ **no local tools** | — | 30 | 30K | 500K | 1,000 |
+| `qwen/qwen3.8-27b` | ✅ | ❌ | 30 | 8K | 200K | 1,000 |
 | `groq/compound` | ❌ **no local tools** | — | 30 | 70K | — | 250 |
+| ~~`llama-3.3-70b-versatile`~~ | **retired 2026-08-16** | — | — | — | — | — |
+| ~~`llama-3.1-8b-instant`~~ | **retired 2026-08-16** | — | — | — | — | — |
+| ~~`meta-llama/llama-4-scout-17b-16e-instruct`~~ | **retired 2026-07-17**, never had local tools | — | — | — | — | — |
+
+Groq moved both Llama ids to enterprise-only on 16 August 2026, so a config that
+worked in July now returns `model_not_found` — an error that reads like a typo.
+Q.U.A.R.K. handles it: the proxy asks the host for `GET /models` and re-routes to
+the best tool-capable model it actually serves, and `GET /api/chat` reports the
+shutdown in `diagnostics.issues`. Set `OPENAI_MODEL=openai/gpt-oss-120b` to skip
+the extra round trip.
 
 **Tokens-per-minute is the limit that actually binds**, not requests-per-day —
 because a tool loop makes several rounds per turn and re-sends the tool
@@ -77,32 +85,36 @@ same subset:
 | Tool declarations | ~4,000 tokens (all 37) | ~600 tokens (typical turn) |
 | System prompt | 1,220 tokens | ~900 tokens |
 | **Fixed overhead per round** | **~5,150** | **~1,500** |
-| Rounds/min on `llama-3.3-70b` (12K TPM) | 2 | ~8 |
 | Rounds/min on `gpt-oss-120b` (8K TPM) | 1 | ~5 |
-| Turns/day on 100K TPD | ~19 | ~65 |
+| Turns/day on 200K TPD | ~19 | ~65 |
 
-Without that, `llama-3.1-8b-instant` (6K TPM) would 429 on the *first* request
-of a turn. Tune it with `QUARK_TOOL_BUDGET` (default 14) or disable it with
+Without that, an 8K TPM model would 429 on the *first* request of a turn — and so
+would any config that still asks for 8,192 output tokens, because the *requested*
+output counts against tokens-per-minute whether or not the model spends it. The
+proxy clamps Groq to 2048 (`QUARK_IGNORE_TPM_CAP=1` opts out on a paid tier). Tune it with `QUARK_TOOL_BUDGET` (default 14) or disable it with
 `QUARK_SEND_ALL_TOOLS=1`.
 
 **Which model to pick:**
 
-- `llama-3.3-70b-versatile` — default. Best tool reliability, parallel tool
-  calls, highest TPM. ~65 turns/day.
-- `openai/gpt-oss-120b` — 2× the daily tokens (200K) and strong reasoning; no
-  parallel tool calls, which Q.U.A.R.K. does not need (it sets
-  `parallel_tool_calls: false` anyway). The adapter sends
-  `max_completion_tokens` for this family automatically.
-- `llama-3.1-8b-instant` — most requests/day by far (14,400) but only 6K TPM
-  and the weakest tool calling of the three. Fine for short factual turns.
+- `openai/gpt-oss-120b` — default, and Groq's own recommended replacement for
+  `llama-3.3-70b-versatile`. Strong reasoning, 200K tokens/day. No parallel tool
+  calls, which Q.U.A.R.K. does not need. The adapter sends
+  `max_completion_tokens`, omits `parallel_tool_calls` (gpt-oss rejects it) and
+  sets `reasoning_format: hidden` — Groq requires `parsed` or `hidden` when tools
+  are declared, otherwise the chain of thought leaks into `content` and the tool
+  call comes back malformed.
+- `qwen/qwen3.6-27b` — the only free-tier model with **parallel** tool calls, and
+  good at structured output. Slightly pricier per token if you ever pay.
+- `openai/gpt-oss-20b` — fastest (~1,000 tok/s) and same daily budget; the
+  weakest reasoning of the three. Good for a demo on bad Wi-Fi.
 
 ```bash
 # .env.local  (or Vercel → Settings → Environment Variables)
 LLM_PROVIDER=openai
 OPENAI_API_KEY=gsk_xxxxxxxxxxxx
 OPENAI_BASE_URL=https://api.groq.com/openai/v1     # this is the default
-OPENAI_MODEL=llama-3.3-70b-versatile               # this is the default
-OPENAI_MAX_TOKENS=2048
+OPENAI_MODEL=openai/gpt-oss-120b                   # this is the default
+OPENAI_MAX_TOKENS=1024                             # 8K tokens/min budget
 
 # optional second line of defence if you also have a Gemini key
 LLM_FALLBACK_PROVIDER=gemini
@@ -288,8 +300,8 @@ is missing.
 LLM_PROVIDER=openai
 OPENAI_API_KEY=gsk_...                      # https://console.groq.com/keys
 OPENAI_BASE_URL=https://api.groq.com/openai/v1
-OPENAI_MODEL=llama-3.3-70b-versatile
-OPENAI_MAX_TOKENS=2048
+OPENAI_MODEL=openai/gpt-oss-120b
+OPENAI_MAX_TOKENS=1024
 
 # Optional second line of defence (fails over on Groq's 30 req/min cap)
 LLM_FALLBACK_PROVIDER=gemini
@@ -315,7 +327,7 @@ and redeploy (env changes never apply to an existing build). Then confirm with:
 
 ```bash
 curl https://your-app.vercel.app/api/chat
-# "provider":"openai", "model":"llama-3.3-70b-versatile",
+# "provider":"openai", "model":"openai/gpt-oss-120b",
 # "providers":{"openai":true,...}, "toolBudget":14
 ```
 

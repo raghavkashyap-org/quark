@@ -191,6 +191,135 @@ check('with no key at all the proxy says so (503, actionable hint)', r.status ==
 health = await (await fetch(`${APP}/api/chat`)).json();
 check('health reports configured:false', health.configured === false, JSON.stringify(health).slice(0, 120));
 
+// ══ PHASE 4 — BOTH providers fail: the primary's reason must survive ═════
+// The reported bug: Groq dies, Gemini is out of quota, and the user only ever
+// sees Gemini's 429 — so "Groq is attached but nothing works" is undiagnosable.
+console.log('\n═══ PHASE 4 · primary dead + fallback out of quota ═══');
+app.kill('SIGKILL');   // keep the mocks alive — phase 4 still needs the Gemini one
+app = await startApp({
+  LLM_PROVIDER: 'openai',
+  OPENAI_API_KEY: 'mock-openai-key',
+  OPENAI_BASE_URL: 'http://127.0.0.1:9997/v1',   // nothing listens here
+  OPENAI_MODEL: 'llama-3.3-70b-versatile',
+  GEMINI_API_KEY: 'mock-test-key',
+  GEMINI_API_BASE: 'http://127.0.0.1:9999/v1beta',
+  LLM_FALLBACK_PROVIDER: 'gemini',
+  QUARK_ALLOWED_ORIGINS: '',
+});
+r = await postChat({ contents: [{ role: 'user', parts: [{ text: 'burn the quota please' }] }] });
+check('when the fallback also fails, the primary\'s reason is included',
+  r.status === 429 && Boolean(r.json?.error?.primaryError),
+  `status=${r.status} primaryError=${JSON.stringify(r.json?.error?.primaryError || null).slice(0, 90)}`);
+check('the primary error names the unreachable host',
+  /9997|network|reach/i.test(JSON.stringify(r.json?.error?.primaryError || '')),
+  JSON.stringify(r.json?.error?.primaryError || '').slice(0, 120));
+check('the fallback\'s own reason is still the headline',
+  /quota/i.test(r.json?.error?.message || ''), String(r.json?.error?.message || '').slice(0, 80));
+
+// ══ PHASE 5 — host-compatibility 400s are healed, not fatal ═════════════
+// Every one of these used to end the turn in LOCAL CORE.
+console.log('\n═══ PHASE 5 · self-healing 400s ═══');
+app.kill('SIGKILL');
+app = await startApp({
+  LLM_PROVIDER: 'openai',
+  OPENAI_API_KEY: 'mock-openai-key',
+  OPENAI_BASE_URL: 'http://127.0.0.1:9998/v1',
+  OPENAI_MODEL: 'llama-3.3-70b-versatile',
+  GEMINI_API_KEY: '',
+  LLM_FALLBACK_PROVIDER: '',
+  QUARK_ALLOWED_ORIGINS: '',
+});
+const wireLog = async () => (await (await fetch('http://127.0.0.1:9998/mock/seen')).json()).requests || [];
+const ask = async (text) => {
+  await fetch('http://127.0.0.1:9998/mock/reset');
+  return postChat({ contents: [{ role: 'user', parts: [{ text }] }] });
+};
+
+r = await ask('badparam check');
+let w = await wireLog();
+check('a rejected parameter is dropped and the turn still succeeds',
+  r.json?.ok === true && w.length >= 2 && w[0].hasParallelToolCalls === true && w[w.length - 1].hasParallelToolCalls === false,
+  `attempts=${w.length} ok=${r.json?.ok} lastParallel=${w[w.length - 1]?.hasParallelToolCalls}`);
+
+r = await ask('failtools check');
+w = await wireLog();
+check('a malformed tool call is retried at a lower temperature (Groq guidance)',
+  r.json?.ok === true && w.length >= 2 && w[0].temperature > w[w.length - 1].temperature,
+  `temps=${w.map((x) => x.temperature).join('→')} ok=${r.json?.ok}`);
+
+r = await ask('notools check');
+w = await wireLog();
+check('if tools keep failing, the turn is answered without them',
+  r.json?.ok === true && w.length >= 2 && w[w.length - 1].tools === 0,
+  `tools=${w.map((x) => x.tools).join('→')} ok=${r.json?.ok}`);
+
+r = await ask('what time is it');
+w = await wireLog();
+check('a healthy request is still sent exactly once (no needless retries)',
+  r.json?.ok === true && w.length === 1, `attempts=${w.length}`);
+check('a non-Groq host keeps the legacy max_tokens (param choice is per host)',
+  w[0]?.tokenParam === 'max_tokens', `tokenParam=${w[0]?.tokenParam}`);
+
+// Same request through a Groq-shaped base URL: the adapter must switch the
+// output-limit field, because Groq rejects the legacy name with a hard 400.
+app.kill('SIGKILL');
+app = await startApp({
+  LLM_PROVIDER: 'openai',
+  OPENAI_API_KEY: 'mock-openai-key',
+  OPENAI_BASE_URL: 'http://127.0.0.1:9998/groq/v1',
+  OPENAI_MODEL: 'openai/gpt-oss-120b',
+  OPENAI_MAX_TOKENS: '8192',   // bigger than Groq's free 8,000 tokens/minute
+  GEMINI_API_KEY: '',
+  LLM_FALLBACK_PROVIDER: '',
+  QUARK_ALLOWED_ORIGINS: '',
+});
+r = await ask('what time is it');
+w = await wireLog();
+check('a Groq base is sent max_completion_tokens, never max_tokens',
+  r.json?.ok === true && w[0]?.tokenParam === 'max_completion_tokens',
+  `tokenParam=${w[0]?.tokenParam} ok=${r.json?.ok}`);
+check('an output ask beyond the free tokens-per-minute budget is clamped',
+  w[0]?.tokenValue === 2048, `tokenValue=${w[0]?.tokenValue}`);
+health = await (await fetch(`${APP}/api/chat`)).json();
+check('diagnostics explains the clamp instead of failing silently',
+  /8,000 tokens\/minute/.test(JSON.stringify(health.diagnostics?.issues || [])),
+  JSON.stringify(health.diagnostics?.issues || []).slice(0, 110));
+
+// ══ PHASE 6 — a retired model id is replaced from the host's own catalogue ══
+// Groq switched off llama-3.3-70b-versatile and llama-3.1-8b-instant on
+// 2026-08-16. The only symptom is `model_not_found`, which reads like a typo.
+console.log('\n═══ PHASE 6 · retired model → live replacement ═══');
+app.kill('SIGKILL');
+app = await startApp({
+  LLM_PROVIDER: 'openai',
+  OPENAI_API_KEY: 'mock-openai-key',
+  OPENAI_BASE_URL: 'http://127.0.0.1:9998/v1',
+  OPENAI_MODEL: 'llama-3.3-70b-versatile',
+  GEMINI_API_KEY: '',
+  LLM_FALLBACK_PROVIDER: '',
+  QUARK_ALLOWED_ORIGINS: '',
+});
+health = await (await fetch(`${APP}/api/chat`)).json();
+const issueText = JSON.stringify(health.diagnostics?.issues || []);
+check('diagnostics names the shutdown, the date and the replacement',
+  /switched off/.test(issueText) && /2026-08-16/.test(issueText) && /openai\/gpt-oss-120b/.test(issueText),
+  issueText.slice(0, 140));
+
+r = await ask('retiredmodel check');
+w = await wireLog();
+check('the turn is retried on a model the host actually serves',
+  r.json?.ok === true && w.length >= 2 && w[0].model === 'llama-3.3-70b-versatile'
+    && w[w.length - 1].model === 'openai/gpt-oss-120b',
+  `models=${w.map((x) => x.model).join('→')} ok=${r.json?.ok}`);
+check('the swap is reported back to the client',
+  /switched to openai\/gpt-oss-120b/.test(r.json?.recoveredWith || ''), String(r.json?.recoveredWith));
+check('the replacement request drops what gpt-oss rejects and adds what Groq needs',
+  w[0].hasParallelToolCalls === true && w[w.length - 1].hasParallelToolCalls === false
+    && w[w.length - 1].reasoningFormat === 'hidden',
+  `parallel=${w.map((x) => x.hasParallelToolCalls).join('→')} reasoning=${w.map((x) => x.reasoningFormat).join('→')}`);
+check('a non-tool-capable id is never picked as the replacement',
+  !w.some((x) => /compound|guard|whisper/.test(String(x.model))), w.map((x) => x.model).join(','));
+
 shutdown();
 const passed = results.filter((r2) => r2.p).length;
 console.log(`\n${'═'.repeat(34)}\n  ${passed}/${results.length} provider checks passed\n${'═'.repeat(34)}`);

@@ -390,7 +390,24 @@ export function QuarkProvider({ children }) {
       // truth — only this one answer had to be resolved locally.
       const runOffline = async (err, { keepBadge = false, emptyReason = '' } = {}) => {
         if (!keepBadge) {
-          setConn((c) => ({ ...c, state: 'offline', detail: explainError(err) }));
+          // When BOTH providers failed, say why each did — a bare "quota
+          // exhausted" hides the fact that the primary (Groq) died first.
+          const primary = err?.primaryError
+            ? ` Primary (${err.primaryError.provider || 'openai'}) failed first: `
+              + `${String(err.primaryError.hint || err.primaryError.message || err.primaryError.code || err.primaryError.status || 'unknown').slice(0, 140)}`
+            : '';
+          setConn((c) => ({ ...c, state: 'offline', detail: explainError(err) + primary }));
+          if (err?.primaryError) {
+            pushToast({
+              kind: 'warn',
+              title: 'Both model providers failed',
+              message:
+                `Groq/openai said: ${String(err.primaryError.hint || err.primaryError.message || err.primaryError.status || 'unknown').slice(0, 160)}`
+                + ` — then the fallback said: ${String(err.hint || err.message || err.code || '').slice(0, 120)}`
+                + ' Running on the local core.',
+              ttl: 14000,
+            });
+          }
         }
         activity.push(STATES.PROCESSING, 'local core engaged');
         const plan = offlinePlan(text, ctx);

@@ -8,7 +8,7 @@
     "build": "next build",
     "start": "next start -H 0.0.0.0 -p 3000",
     "lint": "eslint . --ext .js,.jsx",
-    "test": "node tests/unit-calc.mjs && node tests/unit-offline-brain.mjs && node tests/unit-tool-selection.mjs",
+    "test": "node tests/unit-calc.mjs && node tests/unit-offline-brain.mjs && node tests/unit-tool-selection.mjs && node tests/unit-openai-adapter.mjs",
     "test:e2e": "node tests/e2e-browser.mjs",
     "test:live": "node tests/mock-gemini-server.mjs & sleep 1 && node tests/e2e-live-model.mjs",
     "mock:gemini": "node tests/mock-gemini-server.mjs",

@@ -159,7 +159,8 @@ Project → **Settings → Environment Variables**:
 | `LLM_FALLBACK_PROVIDER` | the other one — optional but recommended | all |
 | `OPENAI_API_KEY` | a free Groq key from <https://console.groq.com/keys> | all |
 | `OPENAI_BASE_URL` | `https://api.groq.com/openai/v1` *(default)* | all |
-| `OPENAI_MODEL` | `llama-3.3-70b-versatile` *(default — must support function calling)* | all |
+| `OPENAI_MODEL` | `openai/gpt-oss-120b` *(default — must support function calling)* | all |
+| `OPENAI_MAX_TOKENS` | `1024` *(clamped to 2048 on Groq: the free tier is 8K tokens/min and the requested output counts)* | all |
 | `QUARK_TOOL_BUDGET` | `14` *(optional — this is the default)* | all |
 
 The last two matter if you switch to a **thinking model** (`gemini-2.5-pro`,
@@ -331,6 +332,104 @@ audio is never uploaded and no quota is spent. `/api/transcribe` (which does use
 the Gemini key) is now the *third* fallback, not the second.
 
 That makes the demo **safe to present on bad college Wi-Fi**.
+
+### If the key is set but every reply still comes from LOCAL CORE
+
+This is the failure mode that is easiest to misread, because the HUD looks
+healthy: the badge flips to **LOCAL CORE** and the local engine answers, so it
+*seems* like the provider was never configured. It usually means the provider
+**rejected the request at runtime**. Three steps:
+
+**1. Read the diagnostics endpoint.** `GET https://<your-app>/api/chat` reports
+what the server actually sees — no guesswork about Vercel's env UI:
+
+```json
+{ "configured": true, "provider": "openai",
+  "diagnostics": { "requestedProvider": "openai", "effectiveProvider": "openai",
+    "openai": { "key": { "present": true, "length": 56, "hasWhitespace": false },
+                "base": "https://api.groq.com/openai/v1", "model": "openai/gpt-oss-120b" },
+    "issues": [] } }
+```
+
+`issues: []` + `configured: true` means the *configuration* is fine and the
+problem is on the wire — go to step 2.
+
+**2. Send one request and read `error.primaryError`.** When the primary provider
+fails and the fallback fails too, the response carries **both** reasons:
+
+```json
+{ "ok": false, "error": {
+    "code": "rate_limited", "message": "Gemini quota exhausted…", "status": 429,
+    "primaryError": { "code": "bad_request", "status": 400,
+                      "hint": "…unsupported parameter: 'max_tokens'…" } } }
+```
+
+`primaryError` is the one that matters — it is the provider you actually
+configured. The same text is pushed to the HUD as a toast, so you can see it
+during a demo without opening devtools.
+
+**3. Match the code to the fix.**
+
+| `primaryError.code` | What it means | Fix |
+| --- | --- | --- |
+| `auth` (401) | key wrong / revoked / pasted with a stray character | re-copy the key; check `diagnostics.openai.key.hasWhitespace` |
+| `bad_model` (404, or Groq's 400 `model_not_found`) | the host retired or renamed that model id | the proxy already asks the host for `GET /models` and re-routes to the best tool-capable model it actually serves. Set `OPENAI_MODEL` to that id to skip the extra round trip |
+| `bad_request` (400) | a parameter the host rejects | Groq removed the legacy `max_tokens`; the adapter now sends `max_completion_tokens` for Groq hosts and `gpt-oss` models. Make sure the deployed build includes it |
+| `rate_limited` (429) | free-tier TPM/RPM/RPD exhausted | wait for the window to reset, lower `QUARK_TOOL_BUDGET`, or use a second key |
+| `network` (504) | the host is unreachable from the serverless runtime | check `OPENAI_BASE_URL` for typos; Vercel must be able to reach it |
+
+Three Groq-specific traps worth knowing:
+
+- **Models are retired without notice.** `llama-3.3-70b-versatile` and
+  `llama-3.1-8b-instant` were switched off on **16 August 2026** and are
+  enterprise-only now; the free tier runs on `openai/gpt-oss-120b`,
+  `openai/gpt-oss-20b` and `qwen/qwen3.6-27b`. The error is a `model_not_found`
+  that reads like a typo, so check `console.groq.com/docs/deprecations` before
+  blaming the key.
+- **The free tier is counted per minute and per day** — 30 requests/min,
+  1,000/day, 8,000 tokens/min, 200,000 tokens/day — and one Q.U.A.R.K. turn is
+  several requests when the model calls tools.
+- **The requested output counts against tokens-per-minute** whether or not the
+  model uses it. `OPENAI_MAX_TOKENS=8192` on an 8K TPM model 429s on the *first*
+  request, which looks exactly like a dead key. The proxy clamps Groq to 2048 and
+  says so in `diagnostics.issues`; set `QUARK_IGNORE_TPM_CAP=1` on a paid tier.
+
+**400s are now repaired automatically.** Three host-compatibility failures used to
+kill the turn and drop it to LOCAL CORE; the proxy now retries the same turn with a
+corrected request instead:
+
+| Host says | What the proxy does |
+| --- | --- |
+| `Unsupported parameter: 'x'` | drops `x` and retries once |
+| `tool_use_failed` / "Failed to call a function" | retries at `temperature: 0.2` (Groq's own guidance), then once more with no tools so you still get an answer |
+| `model_not_found` (404 or 400) | asks the host for `GET /models`, picks the best tool-capable id it serves, retries once |
+
+A repaired turn carries `"recoveredWith": "lowered temperature"` (or similar) in the
+API response, so you can tell it happened. Parameter choice is per host: Groq and
+`gpt-oss` models get `max_completion_tokens`, everything else (Ollama, llama.cpp,
+LM Studio, OpenRouter) keeps `max_tokens` — sending the wrong one is a hard 400 on
+every request, which is exactly how "the key is set but only LOCAL CORE answers"
+presents.
+
+**Check the provider directly.** To separate "our proxy" from "Groq", run this with
+the same key that is in Vercel:
+
+```bash
+curl -s https://api.groq.com/openai/v1/chat/completions \
+  -H "Authorization: Bearer $GROQ_API_KEY" -H "Content-Type: application/json" \
+  -d '{"model":"openai/gpt-oss-120b","messages":[{"role":"user","content":"ping"}],"max_completion_tokens":16}'
+```
+
+List what your key can actually use — this is the same call the proxy makes when
+a model id is rejected:
+
+```bash
+curl -s https://api.groq.com/openai/v1/models -H "Authorization: Bearer $GROQ_API_KEY"
+```
+
+A completion comes back → the key and model are fine, so any remaining failure is
+in the deployment (redeploy the current build). `401` → the key. `404` → the model
+id. `429` → the free-tier window, which resets per minute and per day.
 
 ### If a live reply comes back empty
 
